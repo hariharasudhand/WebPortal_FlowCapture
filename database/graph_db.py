@@ -1,19 +1,18 @@
 from neo4j import GraphDatabase
 import networkx as nx
 import time
+import json  
 
 # Graph Database (Neo4j) Connection
 NEO4J_URI = "bolt://localhost:7687"
 NEO4J_USER = "neo4j"
-NEO4J_PASSWORD = "Welcome123$"
+NEO4J_PASSWORD = "TempReset123!"
 driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
 
 # NetworkX graph for in-memory representation
 G = nx.DiGraph()
 
 # Initialize database with required constraints and indexes
-
-
 def init_database():
     with driver.session() as session:
         try:
@@ -62,14 +61,11 @@ def init_database():
                     session.run(
                         "CREATE CONSTRAINT ON (p:Page) ASSERT p.url IS UNIQUE")
                 except Exception:
-                    # Constraint might already exist
                     pass
-
                 try:
                     session.run(
                         "CREATE CONSTRAINT ON (f:Form) ASSERT f.id IS UNIQUE")
                 except Exception:
-                    # Constraint might already exist
                     pass
 
                 # Create indexes (older syntax)
@@ -78,7 +74,6 @@ def init_database():
                     session.run("CREATE INDEX ON :Page(timestamp)")
                     session.run("CREATE INDEX ON :Page(session_id)")
                 except Exception:
-                    # Indexes might already exist
                     pass
 
             return True
@@ -86,7 +81,6 @@ def init_database():
             print(
                 f"Error detecting Neo4j version or creating constraints: {e}")
 
-            # Fallback: try minimal setup without constraints
             try:
                 # Just create basic indices without constraints
                 session.run(
@@ -98,12 +92,9 @@ def init_database():
                 return False
 
 # Store in Neo4j
-
-
 def store_in_neo4j(url, metadata, referrer=None, session_id=None):
     with driver.session() as session:
         try:
-            # Determine if this is a special page type
             is_alert = metadata.get("is_alert", False)
             page_type = "Alert" if is_alert else "Page"
 
@@ -146,7 +137,7 @@ def store_in_neo4j(url, metadata, referrer=None, session_id=None):
                 SET p.standalone_fields = $fields
                 """, url=url, fields=str(fields))
 
-            # Store actions
+            # Store actions (basic action metadata if present in metadata)
             actions = metadata.get("actions", [])
             if actions:
                 session.run("""
@@ -164,7 +155,6 @@ def store_in_neo4j(url, metadata, referrer=None, session_id=None):
 
             # Store meta tags as separate properties
             for key, value in metadata.get("meta_tags", {}).items():
-                # Replace dots and special characters in property names
                 safe_key = key.replace(".", "_").replace(
                     ":", "_").replace("-", "_")
                 session.run("""
@@ -284,67 +274,78 @@ def store_in_neo4j(url, metadata, referrer=None, session_id=None):
             print(f"Error storing in Neo4j: {e}")
             return False
 
-
 def get_flow_data(session_id=None):
-    """Retrieve flow data from Neo4j for visualization"""
+    """Retrieve flow data from Neo4j for visualization, including singleton pages"""
     with driver.session() as session:
         try:
-            # Get all paths in the graph
+            flows = []
+
             if session_id:
-                # Improved filtering by session - ensure both nodes in the path belong to the same session
-                result = session.run("""
+                # Paths with LEADS_TO
+                result_paths = session.run("""
                 MATCH path = (a)-[:LEADS_TO*]->(b)
                 WHERE NOT a:Form AND NOT b:Form
-                AND a.session_id = $session_id AND b.session_id = $session_id
+                  AND a.session_id = $session_id AND b.session_id = $session_id
                 RETURN path
                 """, session_id=session_id)
+
+                # Singleton pages (no incoming/outgoing edges)
+                result_singletons = session.run("""
+                MATCH (p:Page {session_id:$session_id})
+                WHERE NOT (p)-[:LEADS_TO]->(:Page {session_id:$session_id})
+                  AND NOT (:Page {session_id:$session_id})-[:LEADS_TO]->(p)
+                RETURN p
+                """, session_id=session_id)
             else:
-                # Get all paths
-                result = session.run("""
+                # All paths across sessions
+                result_paths = session.run("""
                 MATCH path = (a)-[:LEADS_TO*]->(b)
                 WHERE NOT a:Form AND NOT b:Form
                 RETURN path
                 """)
 
-            # Process the results
-            flows = []
-            for record in result:
+                # All singleton pages
+                result_singletons = session.run("""
+                MATCH (p:Page)
+                WHERE NOT (p)-[:LEADS_TO]->(:Page) AND NOT (:Page)-[:LEADS_TO]->(p)
+                RETURN p
+                """)
+
+            # Process path results
+            for record in result_paths:
                 path = record["path"]
                 flow_path = []
-
                 for rel in path.relationships:
                     start_node = rel.start_node
                     end_node = rel.end_node
-
-                    # Get properties
-                    start_url = start_node["url"]
-                    start_title = start_node.get("title", "Unknown")
-
-                    end_url = end_node["url"]
-                    end_title = end_node.get("title", "Unknown")
-
-                    # Determine if this is a special node type
-                    is_alert = end_node.get("is_alert", False)
-
-                    # Add to path
                     flow_path.append({
-                        "from_url": start_url,
-                        "from_title": start_title,
-                        "to_url": end_url,
-                        "to_title": end_title,
-                        "is_alert": is_alert
+                        "from_url": start_node["url"],
+                        "from_title": start_node.get("title", "Unknown"),
+                        "to_url": end_node["url"],
+                        "to_title": end_node.get("title", "Unknown"),
+                        "is_alert": end_node.get("is_alert", False)
                     })
+                if flow_path:
+                    flows.append(flow_path)
 
-                flows.append(flow_path)
+            # Process singleton results
+            for record in result_singletons:
+                node = record["p"]
+                flows.append([{
+                    "from_url": node["url"],
+                    "from_title": node.get("title", "Unknown"),
+                    "to_url": node["url"],
+                    "to_title": node.get("title", "Unknown"),
+                    "is_alert": node.get("is_alert", False)
+                }])
 
             return flows
         except Exception as e:
             print(f"Error getting flow data: {e}")
             return []
 
+
 # Query page details from Neo4j
-
-
 def get_page_details(url):
     """Get detailed information about a specific page from Neo4j with enhanced field relationships"""
     with driver.session() as session:
@@ -363,13 +364,13 @@ def get_page_details(url):
             page = record["p"]
             forms = record["forms"]
 
-            # Get all properties
+            # Get all properties (includes page_actions if present)
             properties = dict(page.items())
 
             # Enhanced forms processing with field relationships
             form_details = []
             for form in forms:
-                if form:  # Some forms might be null
+                if form: 
                     form_data = dict(form.items())
 
                     # Try to get field relationships for this form
@@ -437,8 +438,6 @@ def get_page_details(url):
             return None
 
 # Get statistics about captured data
-
-
 def get_capture_stats(session_id=None):
     """Get statistics about the captured data"""
     with driver.session() as session:
@@ -536,12 +535,35 @@ def get_capture_stats(session_id=None):
             }
 
 # Close the Neo4j connection when the application exits
-
-
 def close_neo4j_connection():
     if driver:
         driver.close()
 
+# Helper to mirror Postgres page_actions into Neo4j 
+def update_page_actions(url, actions_obj_or_str):
+    """
+    Upsert the full page_actions JSON (as a string) into the Page node.
+    Call this whenever you append/flush actions to Postgres so Neo4j stays in sync.
+
+    :param url: Page URL key
+    :param actions_obj_or_str: dict like {"actions":[...]} OR already-stringified JSON
+    """
+    # Normalize to JSON string for a single Neo4j property
+    if isinstance(actions_obj_or_str, (dict, list)):
+        actions_json = json.dumps(actions_obj_or_str, ensure_ascii=False)
+    else:
+        actions_json = str(actions_obj_or_str) if actions_obj_or_str is not None else ""
+
+    with driver.session() as session:
+        try:
+            session.run("""
+                MERGE (p:Page {url: $url})
+                SET p.page_actions = $actions_json
+            """, url=url, actions_json=actions_json)
+            return True
+        except Exception as e:
+            print(f"Error updating page_actions in Neo4j: {e}")
+            return False
 
 # Initialize the database when this module is imported
 init_database()

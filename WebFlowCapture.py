@@ -2,8 +2,6 @@ import sys
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
-from neo4j import GraphDatabase
-import psycopg2
 import numpy as np
 from sentence_transformers import SentenceTransformer
 import subprocess
@@ -28,6 +26,137 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, WebDriverException
 import json
 import csv
+import json
+from database.graph_db import store_in_neo4j as store_in_neo4j_core
+from database.graph_db import update_page_actions as update_page_actions_core
+from database.vector_db import store_in_pgvector as store_in_pgvector_core
+from database.vector_db import append_page_actions as append_page_actions_core
+import datetime
+
+
+
+action_counters = {}  
+
+def _common_url(u: str) -> str:
+    try:
+        host = urlparse(u).netloc or ""
+        return host.lower()
+    except Exception:
+        return ""
+
+
+def _install_action_listeners(browser):
+    """Inject once per page. Captures clicks & data entry with labels, xpaths, form info."""
+    js = r"""
+    (function () {
+    if (window.__wf_installed) return;
+    window.__wf_installed = true;
+    window.__actionLog = [];
+
+    function iso() { return new Date().toISOString().replace(/\.\d+Z$/,'Z'); }
+
+    function getXPath(el) {
+        if (!el || el.nodeType !== 1) return "";
+        if (el.id) return "//*[@id='" + el.id.replace(/'/g,"\\'") + "']";
+        var parts = [];
+        while (el && el.nodeType === 1 && el !== document) {
+        var ix = 1, sib = el.previousSibling;
+        while (sib) { if (sib.nodeType === 1 && sib.nodeName === el.nodeName) ix++; sib = sib.previousSibling; }
+        parts.unshift(el.nodeName.toLowerCase() + "[" + ix + "]");
+        el = el.parentNode;
+        }
+        return "/" + parts.join("/");
+    }
+
+    function formInfo(el) {
+        var f = el && el.closest ? el.closest("form") : null;
+        if (!f) return {name: "", xpath: ""};
+        var name = (f.getAttribute("name") || f.id || "").trim();
+        return {name: name, xpath: getXPath(f)};
+    }
+
+    function labelFor(el) {
+        try {
+        if (!el) return "";
+        var id = el.getAttribute && el.getAttribute("id");
+        if (id) {
+            var l = document.querySelector('label[for="'+ CSS.escape(id) +'"]');
+            if (l && l.innerText) return l.innerText.trim();
+        }
+        if (el.labels && el.labels.length) return (el.labels[0].innerText || "").trim();
+        var aria = (el.getAttribute("aria-label") || el.getAttribute("aria-labelledby") || "").trim();
+        if (aria) return aria;
+        var ph = (el.getAttribute("placeholder") || "").trim();
+        if (ph) return ph;
+        var tag = (el.tagName || "").toLowerCase();
+        if (tag==="button" || el.getAttribute("role")==="button") {
+            var t = (el.innerText || el.value || "").trim();
+            if (t) return t;
+        }
+        var prev = el.previousElementSibling;
+        if (prev && prev.tagName==="LABEL") return (prev.innerText || "").trim();
+        } catch(e){}
+        return (el && (el.name || el.id)) || "";
+    }
+
+    function isSensitive(el) {
+        var t = ((el && el.type) || "").toLowerCase();
+        var n = ((el && (el.name||"")) + " " + (el && (el.id||"")) + " " + (el && (el.getAttribute && el.getAttribute("placeholder") || ""))).toLowerCase();
+        return t==="password" || /pass|pwd|otp|token|secret|ssn|card|cvv|pin/.test(n);
+    }
+
+    // push one normalized action
+    function push(type, el, val) {
+        if (!el) return;
+        var fi = formInfo(el);
+        var sens = isSensitive(el);
+        window.__actionLog.push({
+        type: type,
+        field_label: labelFor(el),
+        field_xpath: getXPath(el),
+        form_name: fi.name || "",
+        form_xpath: fi.xpath || "",
+        data: (type==="enter") ? (sens ? "********" : (val==null ? "" : String(val))) : null,
+        sensitive: !!sens,
+        timestamp: iso()
+        });
+    }
+
+    // clicks
+    document.addEventListener("click", function(e){
+        var el = e.target && e.target.closest && e.target.closest("button, a, input[type='button'], input[type='submit']");
+        if (el) push("click", el, null);
+    }, true);
+
+    // commit text on Enter
+    document.addEventListener("keyup", function(e){
+        var el = e.target;
+        if (!el || !(el.matches && el.matches("input, textarea"))) return;
+        if (e.key === "Enter") push("enter", el, el.value);
+    }, true);
+
+    // commit text when leaving the field
+    document.addEventListener("blur", function(e){
+        var el = e.target;
+        if (!el || !(el.matches && el.matches("input, textarea, select"))) return;
+        var v = (el.tagName==="SELECT") ? el.value : el.value;
+        push("enter", el, v);
+    }, true);
+    })();
+    """
+    try:
+        browser.execute_script(js)
+    except Exception as e:
+        print(f"Could not install action listeners: {e}")
+
+
+def _drain_actions(browser):
+    """Pull and clear the JS-side buffer; return list of action dicts."""
+    try:
+        actions = browser.execute_script("var a = window.__actionLog || []; window.__actionLog = []; return a;")
+        return actions or []
+    except Exception:
+        return []
 
 
 def extract_shadow_dom_fields(browser):
@@ -259,7 +388,7 @@ def generate_css_selector(element):
     selectors = []
 
     try:
-        # Try ID first (most reliable)
+        # Try ID first 
         element_id = element.get_attribute("id")
         if element_id:
             selectors.append(f"#{element_id}")
@@ -327,7 +456,7 @@ def generate_css_selector(element):
     except Exception as e:
         print(f"Error generating CSS selector: {e}")
 
-    return selectors[:3]  # Return top 3 selectors
+    return selectors[:3]  
 
 
 def extract_forms_with_selenium(browser):
@@ -418,303 +547,6 @@ def extract_forms_with_selenium(browser):
     return forms_data
 
 
-def extract_enhanced_metadata(html):
-    """
-    Enhanced metadata extraction with comprehensive field detection
-    """
-    soup = BeautifulSoup(html or "", "html.parser")
-    print(f"🔍 Parsing HTML content: {len(html)} characters")
-
-    def cls(elem):
-        return " ".join(elem.get("class", [])) if elem and elem.get("class") else ""
-
-    fields = []
-
-    # INPUTS - Enhanced detection
-    input_elements = soup.find_all("input")
-    print(f"Found {len(input_elements)} input elements")
-
-    for idx, tag in enumerate(input_elements):
-        try:
-            field_data = {
-                "element_type": "input",
-                "tag": "input",
-                "type": tag.get("type", "text"),
-                "name": tag.get("name", "") or "",
-                "id": tag.get("id", "") or "",
-                "placeholder": tag.get("placeholder", "") or "",
-                "class": cls(tag),
-                "value": tag.get("value", "") or "",
-                "required": tag.has_attr("required"),
-                "disabled": tag.has_attr("disabled"),
-                "displayed": True,
-                "aria_label": tag.get("aria-label", "") or tag.get("aria-labelledby", ""),
-                "autocomplete": tag.get("autocomplete", "") or "",
-                "onclick": tag.get("onclick", "") or "",
-                "data_attributes": {k: v for k, v in tag.attrs.items() if k.startswith("data-")},
-                "css_selectors": [],
-                "text": tag.get_text(strip=True) or "",
-                "source": "beautifulsoup"
-            }
-
-            # Generate CSS selectors
-            selectors = []
-            if field_data["id"]:
-                selectors.append(f"#{field_data['id']}")
-            if field_data["name"]:
-                selectors.append(f"input[name='{field_data['name']}']")
-            if field_data["placeholder"]:
-                selectors.append(
-                    f"input[placeholder='{field_data['placeholder']}']")
-            if field_data["type"]:
-                selectors.append(f"input[type='{field_data['type']}']")
-
-            field_data["css_selectors"] = selectors
-            fields.append(field_data)
-
-        except Exception as e:
-            print(f"Error processing input {idx}: {e}")
-
-    # TEXTAREAS
-    textarea_elements = soup.find_all("textarea")
-    print(f"Found {len(textarea_elements)} textarea elements")
-
-    for idx, tag in enumerate(textarea_elements):
-        try:
-            field_data = {
-                "element_type": "textarea",
-                "tag": "textarea",
-                "type": "textarea",
-                "name": tag.get("name", "") or "",
-                "id": tag.get("id", "") or "",
-                "placeholder": tag.get("placeholder", "") or "",
-                "class": cls(tag),
-                "value": tag.get_text(strip=True),
-                "required": tag.has_attr("required"),
-                "disabled": tag.has_attr("disabled"),
-                "displayed": True,
-                "rows": tag.get("rows", "") or "",
-                "cols": tag.get("cols", "") or "",
-                "aria_label": tag.get("aria-label", "") or tag.get("aria-labelledby", ""),
-                "autocomplete": tag.get("autocomplete", "") or "",
-                "onclick": tag.get("onclick", "") or "",
-                "data_attributes": {k: v for k, v in tag.attrs.items() if k.startswith("data-")},
-                "text": tag.get_text(strip=True) or "",
-                "source": "beautifulsoup"
-            }
-
-            # Generate CSS selectors
-            selectors = []
-            if field_data["id"]:
-                selectors.append(f"#{field_data['id']}")
-            if field_data["name"]:
-                selectors.append(f"textarea[name='{field_data['name']}']")
-            if field_data["placeholder"]:
-                selectors.append(
-                    f"textarea[placeholder='{field_data['placeholder']}']")
-
-            field_data["css_selectors"] = selectors
-            fields.append(field_data)
-
-        except Exception as e:
-            print(f"Error processing textarea {idx}: {e}")
-
-    # SELECTS
-    select_elements = soup.find_all("select")
-    print(f"Found {len(select_elements)} select elements")
-
-    for idx, tag in enumerate(select_elements):
-        try:
-            options = []
-            for o in tag.find_all("option"):
-                options.append({
-                    "value": o.get("value", ""),
-                    "text": o.get_text(strip=True),
-                    "selected": o.has_attr("selected")
-                })
-
-            field_data = {
-                "element_type": "select",
-                "tag": "select",
-                "type": "select",
-                "name": tag.get("name", "") or "",
-                "id": tag.get("id", "") or "",
-                "class": cls(tag),
-                "required": tag.has_attr("required"),
-                "disabled": tag.has_attr("disabled"),
-                "displayed": True,
-                "multiple": tag.has_attr("multiple"),
-                "options": options,
-                "options_count": len(options),
-                "aria_label": tag.get("aria-label", "") or tag.get("aria-labelledby", ""),
-                "autocomplete": tag.get("autocomplete", "") or "",
-                "onclick": tag.get("onclick", "") or "",
-                "data_attributes": {k: v for k, v in tag.attrs.items() if k.startswith("data-")},
-                "text": tag.get_text(strip=True) or "",
-                "source": "beautifulsoup"
-            }
-
-            # Generate CSS selectors
-            selectors = []
-            if field_data["id"]:
-                selectors.append(f"#{field_data['id']}")
-            if field_data["name"]:
-                selectors.append(f"select[name='{field_data['name']}']")
-
-            field_data["css_selectors"] = selectors
-            fields.append(field_data)
-
-        except Exception as e:
-            print(f"Error processing select {idx}: {e}")
-
-    # BUTTONS
-    button_elements = soup.find_all("button")
-    print(f"Found {len(button_elements)} button elements")
-
-    for idx, tag in enumerate(button_elements):
-        try:
-            field_data = {
-                "element_type": "button",
-                "tag": "button",
-                "type": f"button_{tag.get('type', 'button')}",
-                "name": tag.get("name", "") or "",
-                "id": tag.get("id", "") or "",
-                "class": cls(tag),
-                "text": tag.get_text(strip=True) or "",
-                "value": tag.get("value", "") or "",
-                "disabled": tag.has_attr("disabled"),
-                "displayed": True,
-                "onclick": tag.get("onclick", "") or "",
-                "form": tag.get("form", "") or "",
-                "aria_label": tag.get("aria-label", "") or tag.get("aria-labelledby", ""),
-                "data_attributes": {k: v for k, v in tag.attrs.items() if k.startswith("data-")},
-                "source": "beautifulsoup"
-            }
-
-            # Generate CSS selectors
-            selectors = []
-            if field_data["id"]:
-                selectors.append(f"#{field_data['id']}")
-            if field_data["text"]:
-                selectors.append(f"button:contains('{field_data['text']}')")
-
-            field_data["css_selectors"] = selectors
-            fields.append(field_data)
-
-        except Exception as e:
-            print(f"Error processing button {idx}: {e}")
-
-    # FORMS - Enhanced form processing
-    forms = []
-    form_elements = soup.find_all("form")
-    print(f"Found {len(form_elements)} form elements")
-
-    for idx, form in enumerate(form_elements):
-        try:
-            controls = []
-            # Get all form controls
-            for c in form.find_all(["input", "textarea", "select", "button"]):
-                ctrl = {
-                    "name": c.get("name", "") or "",
-                    "type": (c.get("type", "") if c.name == "input" else c.name),
-                    "id": c.get("id", "") or "",
-                    "placeholder": c.get("placeholder", "") or "",
-                    "class": cls(c),
-                    "required": c.has_attr("required"),
-                    "disabled": c.has_attr("disabled"),
-                    "value": (c.get("value", "") or c.get_text(strip=True)),
-                    "text": (c.get_text(strip=True) if c.name == "button" else ""),
-                    "autocomplete": c.get("autocomplete", "") or "",
-                    "aria_label": c.get("aria-label", "") or c.get("aria-labelledby", ""),
-                    "onclick": c.get("onclick", "") or ""
-                }
-
-                if c.name == "select":
-                    ctrl["options"] = [opt.get_text(
-                        strip=True) for opt in c.find_all("option")]
-                    ctrl["multiple"] = c.has_attr("multiple")
-
-                controls.append(ctrl)
-
-            form_data = {
-                "form_index": idx,
-                "action": form.get("action", "") or "",
-                "method": (form.get("method", "get") or "get").upper(),
-                "name": form.get("name", "") or "",
-                "id": form.get("id", "") or "",
-                "class": cls(form),
-                "enctype": form.get("enctype", "application/x-www-form-urlencoded"),
-                "target": form.get("target", "") or "",
-                "autocomplete": form.get("autocomplete", "") or "",
-                "novalidate": form.has_attr("novalidate"),
-                "fields": controls,
-                "field_count": len(controls)
-            }
-
-            forms.append(form_data)
-
-        except Exception as e:
-            print(f"Error processing form {idx}: {e}")
-
-    # Title, headings
-    title = (soup.title.string.strip()
-             if soup.title and soup.title.string else "")
-
-    headings = []
-    for i in range(1, 7):
-        for h in soup.find_all(f"h{i}"):
-            headings.append({
-                "level": i,
-                "text": h.get_text(strip=True),
-                "id": h.get("id", ""),
-                "class": cls(h)
-            })
-
-    # Field summary with enhanced statistics
-    input_types = {}
-    identifiable_fields = 0
-    for f in fields:
-        if f.get("element_type") == "input":
-            t = (f.get("type") or "text").lower()
-            input_types[t] = input_types.get(t, 0) + 1
-
-        # Count as identifiable if it has ANY of these attributes
-        if (f.get("name") or f.get("id") or f.get("field_id") or
-            f.get("aria_label") or f.get("placeholder") or
-                f.get("data_attributes") or f.get("text")):
-            identifiable_fields += 1
-
-    field_summary = {
-        "total_fields": len(fields),
-        "named_fields": sum(1 for f in fields if f.get("name")),
-        "id_fields": sum(1 for f in fields if (f.get("id") or f.get("field_id"))),
-        "placeholder_fields": sum(1 for f in fields if f.get("placeholder")),
-        "required_fields": sum(1 for f in fields if f.get("required")),
-        "aria_labeled_fields": sum(1 for f in fields if f.get("aria_label")),
-        "class_fields": sum(1 for f in fields if f.get("class")),
-        "data_attribute_fields": sum(1 for f in fields if f.get("data_attributes")),
-        "identifiable_fields": identifiable_fields,  # NEW: comprehensive identification
-        "button_fields": sum(1 for f in fields if f.get("element_type") == "button"),
-        "input_types": input_types,
-        "forms_count": len(forms),
-        "total_actions": sum(1 for f in fields if f.get("element_type") == "button"),
-        "enhancement_level": "basic"  # Will be "enhanced" if Selenium is used
-    }
-
-    print(f"📊 Field summary: {field_summary}")
-
-    return {
-        "title": title,
-        "fields": fields,
-        "forms": forms,
-        "headings": headings,
-        "field_summary": field_summary,
-        "timestamp": int(time.time() * 1000),
-        "url_analyzed": True,
-        "enhanced_with_selenium": False
-    }
-
-
 def debug_page_structure(browser):
     """Debug function to analyze page structure"""
     if not browser:
@@ -773,38 +605,8 @@ def debug_page_structure(browser):
         print(f"Debug analysis error: {e}")
 
 
-# Disable SSL warnings
 warnings.filterwarnings('ignore', message='Unverified HTTPS request')
 
-# Initialize embedding model
-model = SentenceTransformer("all-MiniLM-L6-v2")
-
-# Graph Database (Neo4j) Connection
-NEO4J_URI = "bolt://localhost:7687"
-NEO4J_USER = "neo4j"
-NEO4J_PASSWORD = "Welcome123$"
-driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
-
-# Vector Database (PostgreSQL with pgvector)
-PG_CONN = psycopg2.connect(
-    dbname="vector_db", user="harid", password="", host="localhost")
-PG_CURSOR = PG_CONN.cursor()
-
-# Enhanced table creation with more columns for better field tracking
-PG_CURSOR.execute("""
-CREATE TABLE IF NOT EXISTS page_embeddings (
-    url TEXT PRIMARY KEY, 
-    embedding vector(384),
-    content TEXT,
-    timestamp FLOAT,
-    total_fields INTEGER DEFAULT 0,
-    named_fields INTEGER DEFAULT 0,
-    id_fields INTEGER DEFAULT 0,
-    placeholder_fields INTEGER DEFAULT 0,
-    forms_count INTEGER DEFAULT 0
-);
-""")
-PG_CONN.commit()
 
 flows = {}
 field_stats = {}
@@ -1084,6 +886,65 @@ def extract_enhanced_metadata(html):
         "url_analyzed": True
     }
 
+def extract_enhanced_metadata_with_selenium(html, browser):
+    """
+    Base = BeautifulSoup parse; then augment with Selenium + Shadow DOM.
+    """
+    base = extract_enhanced_metadata(html)
+
+    # Selenium augment: dynamic fields + forms
+    dyn_fields = extract_dynamic_fields_selenium(browser) or []
+    sel_forms  = extract_forms_with_selenium(browser) or []
+    shadow     = extract_shadow_dom_fields(browser) or []
+
+    # Merge fields (avoid obvious duplicates by (name,id,type,placeholder))
+    def sig(f):
+        return (
+            f.get("name",""), f.get("id",""),
+            f.get("type",""), f.get("placeholder",""),
+            f.get("element_type", f.get("tag",""))
+        )
+    seen = {sig(f) for f in base.get("fields", [])}
+    for f in dyn_fields + shadow:
+        ff = dict(f)
+        ff.setdefault("element_type", ff.get("tag", "input"))
+        ff.setdefault("source", "selenium")
+        if sig(ff) not in seen:
+            base["fields"].append(ff)
+            seen.add(sig(ff))
+
+    # Prefer Selenium-discovered forms if we found any
+    if sel_forms:
+        base["forms"] = sel_forms
+
+    # Refresh summary counts
+    fs = base.get("field_summary", {})
+    fields = base.get("fields", [])
+    input_types = {}
+    for f in fields:
+        if (f.get("element_type") == "input") or (f.get("tag") == "input"):
+            t = (f.get("type") or "text").lower()
+            input_types[t] = input_types.get(t, 0) + 1
+
+    fs.update({
+        "total_fields": len(fields),
+        "named_fields": sum(1 for f in fields if f.get("name")),
+        "id_fields":    sum(1 for f in fields if f.get("id")),
+        "placeholder_fields": sum(1 for f in fields if f.get("placeholder")),
+        "required_fields":    sum(1 for f in fields if f.get("required")),
+        "aria_labeled_fields":sum(1 for f in fields if f.get("aria_label")),
+        "class_fields":       sum(1 for f in fields if f.get("class")),
+        "data_attribute_fields": sum(1 for f in fields if f.get("data_attributes")),
+        "input_types": input_types,
+        "forms_count": len(base.get("forms", [])),
+        "selenium_fields": len(dyn_fields),
+        "shadow_dom_fields": len(shadow),
+        "enhancement_level": "enhanced",
+    })
+    base["field_summary"] = fs
+    base["enhanced_with_selenium"] = True
+    return base
+
 
 def record_action(url, content, referrer=None):
     """
@@ -1112,8 +973,11 @@ def record_action(url, content, referrer=None):
         metadata = extract_enhanced_metadata(content)
 
     # Store or update in-memory flows
-    flows[url] = {"metadata": metadata, "content": content}
+    previous_actions = flows.get(url, {}).get("metadata", {}).get("page_actions")
+    if previous_actions:
+        metadata["page_actions"] = previous_actions
     G.add_node(url, metadata=metadata)
+    flows[url] = {"metadata": metadata, "content": content}
     if referrer and referrer in flows:
         G.add_edge(referrer, url)
 
@@ -1200,7 +1064,7 @@ def record_action(url, content, referrer=None):
     neo4j_success = store_in_neo4j_enhanced(
         url, metadata, referrer, session_id)
     vector_success = store_in_pgvector_enhanced(
-        url, content, metadata, session_id)
+        url, content, metadata)
 
     print(
         f"💾 Storage results: Neo4j={'✅' if neo4j_success else '❌'}, Vector={'✅' if vector_success else '❌'}")
@@ -1213,311 +1077,28 @@ def record_action(url, content, referrer=None):
 
     return True
 
-
 def store_in_neo4j_enhanced(url, metadata, referrer=None, session_id=None):
-    """
-    Complete enhanced Neo4j storage with proper form and field relationships
-    """
     try:
-        with driver.session() as session:
-            print(f"💾 Storing in Neo4j: {url}")
-
-            # Get current timestamp and field summary
-            timestamp = metadata.get("timestamp", int(time.time() * 1000))
-            field_summary = metadata.get("field_summary", {})
-
-            # Create page node with comprehensive metadata including new fields
-            session.run("""
-                MERGE (p:Page {url: $url})
-                SET p.title = $title,
-                    p.timestamp = $timestamp,
-                    p.total_fields = $total_fields,
-                    p.named_fields = $named_fields,
-                    p.id_fields = $id_fields,
-                    p.placeholder_fields = $placeholder_fields,
-                    p.required_fields = $required_fields,
-                    p.aria_labeled_fields = $aria_labeled_fields,
-                    p.class_fields = $class_fields,
-                    p.data_attribute_fields = $data_attribute_fields,
-                    p.identifiable_fields = $identifiable_fields,
-                    p.button_fields = $button_fields,
-                    p.forms_count = $forms_count,
-                    p.actions_count = $actions_count,
-                    p.enhanced_with_selenium = $enhanced_with_selenium,
-                    p.enhancement_level = $enhancement_level,
-                    p.session_id = $session_id,
-                    p.last_updated = datetime()
-            """,
-                        url=url,
-                        title=metadata.get("title", ""),
-                        timestamp=timestamp,
-                        total_fields=field_summary.get("total_fields", 0),
-                        named_fields=field_summary.get("named_fields", 0),
-                        id_fields=field_summary.get("id_fields", 0),
-                        placeholder_fields=field_summary.get(
-                            "placeholder_fields", 0),
-                        required_fields=field_summary.get(
-                            "required_fields", 0),
-                        aria_labeled_fields=field_summary.get(
-                            "aria_labeled_fields", 0),
-                        class_fields=field_summary.get("class_fields", 0),
-                        data_attribute_fields=field_summary.get(
-                            "data_attribute_fields", 0),
-                        identifiable_fields=field_summary.get(
-                            "identifiable_fields", 0),
-                        button_fields=field_summary.get("button_fields", 0),
-                        forms_count=field_summary.get("forms_count", 0),
-                        actions_count=field_summary.get("total_actions", 0),
-                        enhanced_with_selenium=metadata.get(
-                            "enhanced_with_selenium", False),
-                        enhancement_level=field_summary.get(
-                            "enhancement_level", "basic"),
-                        session_id=session_id or ""
-                        )
-
-            # Create relationship from referrer if available
-            if referrer:
-                session.run("""
-                    MATCH (r:Page {url: $referrer})
-                    MATCH (p:Page {url: $url})
-                    MERGE (r)-[:LEADS_TO]->(p)
-                """, referrer=referrer, url=url)
-
-            # Store forms and their fields with proper relationships
-            forms = metadata.get("forms", [])
-            print(f"💾 Storing {len(forms)} forms")
-
-            for form_idx, form in enumerate(forms):
-                form_id = f"{url}_form_{form_idx}"
-
-                # Create Form node
-                session.run("""
-                    MATCH (p:Page {url: $url})
-                    MERGE (f:Form {id: $form_id})
-                    SET f.action = $action,
-                        f.method = $method,
-                        f.form_name = $form_name,
-                        f.form_id = $form_id_attr,
-                        f.form_class = $form_class,
-                        f.enctype = $enctype,
-                        f.target = $target,
-                        f.field_count = $field_count,
-                        f.form_index = $form_index,
-                        f.autocomplete = $autocomplete,
-                        f.novalidate = $novalidate,
-                        f.session_id = $session_id
-                    MERGE (p)-[:HAS_FORM]->(f)
-                """,
-                            url=url,
-                            form_id=form_id,
-                            action=form.get("action", ""),
-                            method=form.get("method", "GET"),
-                            form_name=form.get("name", ""),
-                            form_id_attr=form.get("id", ""),
-                            form_class=form.get("class", ""),
-                            enctype=form.get("enctype", ""),
-                            target=form.get("target", ""),
-                            field_count=form.get("field_count", 0),
-                            form_index=form_idx,
-                            autocomplete=form.get("autocomplete", ""),
-                            novalidate=form.get("novalidate", False),
-                            session_id=session_id or ""
-                            )
-
-                # Store form fields with enhanced attributes
-                form_fields = form.get("fields", [])
-                print(
-                    f"💾 Storing {len(form_fields)} fields for form {form_idx}")
-
-                for field_idx, field in enumerate(form_fields):
-                    field_id = f"{form_id}_field_{field_idx}"
-
-                    # Create FormField node with comprehensive attributes
-                    session.run("""
-                        MATCH (f:Form {id: $form_id})
-                        MERGE (fld:FormField {id: $field_id})
-                        SET fld.name = $name,
-                            fld.type = $type,
-                            fld.field_id = $field_id_attr,
-                            fld.placeholder = $placeholder,
-                            fld.class = $field_class,
-                            fld.required = $required,
-                            fld.disabled = $disabled,
-                            fld.text = $text,
-                            fld.value = $value,
-                            fld.autocomplete = $autocomplete,
-                            fld.aria_label = $aria_label,
-                            fld.onclick = $onclick,
-                            fld.field_index = $field_index,
-                            fld.data_attributes = $data_attributes,
-                            fld.css_selectors = $css_selectors,
-                            fld.source = $source,
-                            fld.displayed = $displayed,
-                            fld.session_id = $session_id
-                        MERGE (f)-[:HAS_FIELD]->(fld)
-                    """,
-                                form_id=form_id,
-                                field_id=field_id,
-                                name=field.get("name", ""),
-                                type=field.get("type", "text"),
-                                field_id_attr=field.get("id", ""),
-                                placeholder=field.get("placeholder", ""),
-                                field_class=field.get("class", ""),
-                                required=field.get("required", False),
-                                disabled=field.get("disabled", False),
-                                text=field.get("text", ""),
-                                value=field.get("value", ""),
-                                autocomplete=field.get("autocomplete", ""),
-                                aria_label=field.get("aria_label", ""),
-                                onclick=field.get("onclick", ""),
-                                field_index=field_idx,
-                                data_attributes=str(
-                                    field.get("data_attributes", {})),
-                                css_selectors=str(
-                                    field.get("css_selectors", [])),
-                                source=field.get("source", "beautifulsoup"),
-                                displayed=field.get("displayed", True),
-                                session_id=session_id or ""
-                                )
-
-                    # Store select options if present
-                    if field.get("type") == "select" and field.get("options"):
-                        options = field.get("options", [])
-                        for option_idx, option in enumerate(options):
-                            option_id = f"{field_id}_option_{option_idx}"
-
-                            # Handle both dict and string option formats
-                            if isinstance(option, dict):
-                                option_value = option.get("value", "")
-                                option_text = option.get("text", "")
-                                option_selected = option.get("selected", False)
-                            else:
-                                option_value = str(option)
-                                option_text = str(option)
-                                option_selected = False
-
-                            session.run("""
-                                MATCH (fld:FormField {id: $field_id})
-                                MERGE (opt:SelectOption {id: $option_id})
-                                SET opt.value = $value,
-                                    opt.text = $text,
-                                    opt.selected = $selected,
-                                    opt.option_index = $option_index,
-                                    opt.session_id = $session_id
-                                MERGE (fld)-[:HAS_OPTION]->(opt)
-                            """,
-                                        field_id=field_id,
-                                        option_id=option_id,
-                                        value=option_value,
-                                        text=option_text,
-                                        selected=option_selected,
-                                        option_index=option_idx,
-                                        session_id=session_id or ""
-                                        )
-
-            # Store standalone fields as separate nodes
-            standalone_fields = metadata.get("fields", [])
-            if standalone_fields:
-                print(f"💾 Storing {len(standalone_fields)} standalone fields")
-
-                for field_idx, field in enumerate(standalone_fields):
-                    field_id = f"{url}_standalone_{field_idx}"
-
-                    # Create StandaloneField node
-                    session.run("""
-                        MATCH (p:Page {url: $url})
-                        MERGE (sf:StandaloneField {id: $field_id})
-                        SET sf.name = $name,
-                            sf.type = $type,
-                            sf.field_id = $field_id_attr,
-                            sf.placeholder = $placeholder,
-                            sf.class = $field_class,
-                            sf.text = $text,
-                            sf.value = $value,
-                            sf.aria_label = $aria_label,
-                            sf.field_index = $field_index,
-                            sf.data_attributes = $data_attributes,
-                            sf.css_selectors = $css_selectors,
-                            sf.source = $source,
-                            sf.session_id = $session_id
-                        MERGE (p)-[:HAS_STANDALONE_FIELD]->(sf)
-                    """,
-                                url=url,
-                                field_id=field_id,
-                                name=field.get("name", ""),
-                                type=field.get("type", "unknown"),
-                                field_id_attr=field.get("id", ""),
-                                placeholder=field.get("placeholder", ""),
-                                field_class=field.get("class", ""),
-                                text=field.get("text", ""),
-                                value=field.get("value", ""),
-                                aria_label=field.get("aria_label", ""),
-                                field_index=field_idx,
-                                data_attributes=str(
-                                    field.get("data_attributes", {})),
-                                css_selectors=str(
-                                    field.get("css_selectors", [])),
-                                source=field.get("source", "beautifulsoup"),
-                                session_id=session_id or ""
-                                )
-
-            print(f"✅ Neo4j storage completed successfully for {url}")
-            return True
-
+        return store_in_neo4j_core(url, metadata, referrer, session_id)
     except Exception as e:
         print(f"❌ Error storing in Neo4j: {e}")
-        import traceback
-        traceback.print_exc()
         return False
 
 
-def store_in_pgvector_enhanced(url, content, metadata):
-    """
-    Upsert page into Postgres with embedding + stats.
-    Assumes your table uses pgvector 'vector(384)'. If pgvector adapter is configured,
-    passing a Python list works; otherwise adapt to your converter.
-    """
+def store_in_pgvector_enhanced(url, content, metadata, session_id=None):
     try:
-        soup = BeautifulSoup(content, "html.parser")
-        text_content = soup.get_text().strip()
-
-        # Keep your existing embedding approach (you already import SentenceTransformer as 'model')
-        embedding = model.encode(text_content).astype('float32')
-        field_summary = metadata.get("field_summary", {})
-
-        PG_CURSOR.execute("""
-            INSERT INTO page_embeddings 
-            (url, embedding, content, timestamp, total_fields, named_fields, id_fields, placeholder_fields, forms_count)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (url) DO UPDATE SET
-                embedding = EXCLUDED.embedding,
-                content = EXCLUDED.content,
-                timestamp = EXCLUDED.timestamp,
-                total_fields = EXCLUDED.total_fields,
-                named_fields = EXCLUDED.named_fields,
-                id_fields = EXCLUDED.id_fields,
-                placeholder_fields = EXCLUDED.placeholder_fields,
-                forms_count = EXCLUDED.forms_count;
-        """, (
-            url,
-            embedding.tolist(),          # relies on pgvector adapter
-            text_content,
-            time.time(),
-            field_summary.get("total_fields", 0),
-            field_summary.get("named_fields", 0),
-            field_summary.get("id_fields", 0),
-            field_summary.get("placeholder_fields", 0),
-            field_summary.get("forms_count", 0),
-        ))
-        PG_CONN.commit()
-        return True
+        return store_in_pgvector_core(url, content, metadata, session_id)
     except Exception as e:
-        print(f"Error storing in enhanced vector DB: {e}")
-        PG_CONN.rollback()
+        print(f"❌ Error storing in PGVector: {e}")
         return False
 
 
-# Check if browser is still alive
+def store_page_actions(url, page_actions):
+    try:
+        update_page_actions_core(url, page_actions)            
+        append_page_actions_core(url, page_actions)            
+    except Exception as e:
+        print(f"❌ Error mirroring page_actions: {e}")
 
 
 def is_browser_alive():
@@ -1530,7 +1111,6 @@ def is_browser_alive():
     except:
         return False
 
-# Initialize and start browser with Chrome DevTools Protocol enabled
 
 
 def start_browser():
@@ -1575,6 +1155,82 @@ def stop_browser():
 
 # Enhanced capture function
 
+def _parse_iso_ts(ts: str) -> float:
+    try:
+        return datetime.datetime.fromisoformat(
+            ts.replace("Z", "+00:00")
+        ).timestamp() * 1000.0
+    except Exception:
+        return 0.0
+
+def _dedupe_and_compress_actions(url: str, existing_actions: list, new_actions: list, window_ms: int = 700):
+    """
+    Returns (to_append, updated_indices)
+
+    - Drops rapid duplicate clicks of same (type, field_xpath, form_xpath) in window_ms
+    - For 'enter': if a prior action exists for same field_xpath, we UPDATE that prior
+      action in-place (data/timestamp/flags) instead of appending a new row.
+    """
+    to_append = []
+    updated_indices = set()
+
+    # quick lookups
+    def ts_ms(a):
+        try:
+            return datetime.datetime.fromisoformat(a.get("timestamp","").replace("Z","+00:00")).timestamp()*1000
+        except Exception:
+            return 0.0
+
+    recent = {}  
+    for i, a in enumerate(existing_actions[-10:]):
+        key = (a.get("type"), a.get("field_xpath",""), a.get("form_xpath",""))
+        recent[key] = ts_ms(a)
+
+    # map last 'enter' by field across ALL existing
+    last_enter_idx_by_field = {}
+    for idx in range(len(existing_actions)-1, -1, -1):
+        a = existing_actions[idx]
+        if a.get("type") == "enter":
+            fx = a.get("field_xpath","")
+            if fx and fx not in last_enter_idx_by_field:
+                last_enter_idx_by_field[fx] = idx
+
+    for a in new_actions:
+        t  = a.get("type")
+        fx = a.get("field_xpath","")
+        fpx= a.get("form_xpath","")
+        key= (t, fx, fpx)
+        cur= ts_ms(a)
+
+        # debounce fast duplicates
+        last = recent.get(key, -1e18)
+        if cur - last < window_ms:
+            continue
+        recent[key] = cur
+
+        if t == "enter" and fx:
+            # update prior 'enter' for same field if present
+            if fx in last_enter_idx_by_field:
+                idx = last_enter_idx_by_field[fx]
+                prev = existing_actions[idx]
+                prev["data"]       = a.get("data")
+                prev["sensitive"]  = bool(a.get("sensitive", prev.get("sensitive", False)))
+                prev["field_label"]= prev.get("field_label") or a.get("field_label","")
+                prev["form_name"]  = prev.get("form_name") or a.get("form_name","")
+                prev["form_xpath"] = prev.get("form_xpath") or a.get("form_xpath","")
+                prev["timestamp"]  = a.get("timestamp")
+                updated_indices.add(idx)
+                # keep the mapping pointing to this idx (latest)
+                last_enter_idx_by_field[fx] = idx
+                continue  # do NOT append
+            else:
+                # first time we see this field: append; remember its index
+                last_enter_idx_by_field[fx] = len(existing_actions) + len(to_append)
+
+        to_append.append(a)
+
+    return to_append, updated_indices
+
 
 def capture_web_actions():
     """
@@ -1597,12 +1253,15 @@ def capture_web_actions():
 
         # Navigate to target website
         browser.get(TARGET_WEBSITE)
+        _install_action_listeners(browser)
 
         # Wait for page to fully load
         try:
             WebDriverWait(browser, 10).until(
                 lambda driver: driver.execute_script(
                     "return document.readyState") == "complete")
+            _install_action_listeners(browser)
+        
 
             print("✅ Page loaded completely")
         except TimeoutException:
@@ -1705,6 +1364,7 @@ def capture_web_actions():
                     print(analysis_update)
 
                     last_url = current_url
+                    _install_action_listeners(browser)
                     last_content_hash = hash(html_content)
 
                 # Check for content changes on the same page (AJAX, modal opens, form changes)
@@ -1733,7 +1393,40 @@ def capture_web_actions():
                         signals.update_status.emit(update_info)
                         print(update_info)
 
-                        last_content_hash = current_content_hash
+                        last_content_hash = current_content_hash        
+                try:
+                    actions = _drain_actions(browser)
+                    if actions:
+                        url_for_actions = browser.current_url
+
+                        # assign incremental action_id after filtering
+                        page_actions_obj = flows.setdefault(url_for_actions, {}).setdefault("metadata", {}).setdefault("page_actions", {"actions": []})
+                        existing = page_actions_obj["actions"]
+
+                        # filter & compress
+                        to_append, updated_ix = _dedupe_and_compress_actions(url_for_actions, existing, actions)
+
+                        # apply new action_ids to things we will append
+                        if to_append:
+                            next_id = action_counters.get(url_for_actions, 1)
+                            for a in to_append:
+                                a["action_id"] = next_id
+                                next_id += 1
+                            action_counters[url_for_actions] = next_id
+                            existing.extend(to_append)
+
+                        # persist:
+                        # - if we only updated existing rows -> call UPDATE mirror only
+                        # - if we appended -> call both append (for the new ones) and update (to mirror full state)
+                        if to_append:
+                            update_page_actions_core(url_for_actions, page_actions_obj)  # mirror full state (Neo4j)
+                            append_page_actions_core(url_for_actions, {"actions": to_append})  # append only the new rows (Postgres)
+                        elif updated_ix:
+                            # no new rows; just mirror the updated JSON structure to both stores
+                            update_page_actions_core(url_for_actions, page_actions_obj)
+
+                except Exception as e:
+                    print(f"Action drain error: {e}")
 
                 # Brief pause to avoid high CPU usage
                 time.sleep(0.5)
@@ -1759,7 +1452,6 @@ def capture_web_actions():
     signals.update_status.emit("🛑 Enhanced capture thread stopped")
 
 # Enhanced export function
-
 
 def export_enhanced_visualization():
     """
@@ -1869,7 +1561,7 @@ def export_enhanced_visualization():
                 report += f"    - Class: {form.get('class', 'No class')}\n"
 
                 # Sample field details
-                form_fields = form.get('fields', [])[:5]  # Show first 5 fields
+                form_fields = form.get('fields', [])[:5] 
                 if form_fields:
                     report += f"    - Sample fields:\n"
                     for j, field in enumerate(form_fields):
@@ -1881,7 +1573,7 @@ def export_enhanced_visualization():
             actions = metadata.get('actions', [])
             if actions:
                 report += f"Actions found: {len(actions)}\n"
-                for action in actions[:5]:  # Show first 5 actions
+                for action in actions[:5]:  
                     action_id = action.get('text') or action.get(
                         'id') or action.get('onclick', 'Unknown action')
                     report += f"  - {action.get('type', 'unknown')}: {action_id}\n"
@@ -1958,8 +1650,6 @@ def export_enhanced_visualization():
         return False
 
 # Enhanced PyQt5 UI Class
-
-
 class WebFlowCaptureApp(QWidget):
     def __init__(self):
         super().__init__()
@@ -2356,19 +2046,8 @@ class WebFlowCaptureApp(QWidget):
 
         stop_capturing = True
         stop_browser()
-
-        # Close database connections
-        try:
-            if PG_CURSOR:
-                PG_CURSOR.close()
-            if PG_CONN:
-                PG_CONN.close()
-            if driver:
-                driver.close()
-        except:
-            pass
-
         event.accept()
+
 
 
 if __name__ == '__main__':

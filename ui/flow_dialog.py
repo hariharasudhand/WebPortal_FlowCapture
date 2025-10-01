@@ -6,6 +6,8 @@ from PyQt5.QtCore import pyqtSignal, Qt
 from PyQt5.QtGui import QFont
 import csv
 import os
+import json   
+import ast    
 from datetime import datetime
 
 from database.graph_db import get_flow_data, get_page_details
@@ -99,7 +101,9 @@ class FlowVisualizationDialog(QDialog):
         self.page_preview.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.page_preview.setAlternatingRowColors(True)
         self.page_preview.verticalHeader().setVisible(False)
-        self.page_preview.setMinimumWidth(300)  # Minimum width for the preview
+        self.page_preview.setMinimumWidth(300)  
+        # Helpful to read large JSON blobs
+        self.page_preview.setWordWrap(True)  
         preview_layout.addWidget(self.page_preview)
 
         # View full details button
@@ -204,9 +208,9 @@ class FlowVisualizationDialog(QDialog):
 
                 # Store URL data for both from and to
                 step_item.setData(0, Qt.UserRole, step.get(
-                    'to_url', ''))  # Primary URL (to)
+                    'to_url', '')) 
                 step_item.setData(1, Qt.UserRole, step.get(
-                    'from_url', ''))  # Secondary URL (from)
+                    'from_url', ''))  
 
         self.flow_list.expandAll()
 
@@ -251,6 +255,13 @@ class FlowVisualizationDialog(QDialog):
             if len(summary) > 200:
                 summary = summary[:200] + "..."
             self.addPreviewRow("Summary", summary)
+
+        page_actions_raw = page_details.get("page_actions", "")
+        parsed = self._try_parse_json(page_actions_raw)
+        if isinstance(parsed, dict) and isinstance(parsed.get("actions"), list) and len(parsed["actions"]) > 0:
+            self.addPreviewRow("page_actions", json.dumps(parsed, indent=2, ensure_ascii=False))
+        else:
+            self.addPreviewRow("page_actions", "{}")
 
         # Check if it's an alert
         if page_details.get("is_alert", False):
@@ -311,7 +322,7 @@ class FlowVisualizationDialog(QDialog):
             forms_with_action = 0
             forms_with_names = 0
 
-            for i, form in enumerate(forms[:5]):  # Show first 5 forms
+            for i, form in enumerate(forms[:5]):  
                 form_name = form.get("form_name", "") or form.get(
                     "form_id", "") or f"Form {i+1}"
                 action = form.get("action", "No action")
@@ -419,6 +430,44 @@ class FlowVisualizationDialog(QDialog):
             self.addPreviewRow(
                 "🏷️ Session ID", session_id[:8] + "..." if len(session_id) > 8 else session_id)
 
+    def _pretty_json_or_text(self, raw):
+        """
+        Try to render a nice JSON string; handle dict/list/JSON-string/Python-literal.
+        """
+        try:
+            if isinstance(raw, (dict, list)):
+                return json.dumps(raw, indent=2, ensure_ascii=False)
+            if isinstance(raw, str):
+                try:
+                    return json.dumps(json.loads(raw), indent=2, ensure_ascii=False)
+                except Exception:
+                    try:
+                        val = ast.literal_eval(raw)
+                        return json.dumps(val, indent=2, ensure_ascii=False)
+                    except Exception:
+                        return raw  # as-is
+            return str(raw)
+        except Exception:
+            return str(raw)
+
+    def _try_parse_json(self, raw):
+        try:
+            if isinstance(raw, (dict, list)):
+                return raw
+            if isinstance(raw, str) and raw.strip():
+                try:
+                    return json.loads(raw)
+                except Exception:
+                    import ast
+                    try:
+                        return ast.literal_eval(raw)
+                    except Exception:
+                        return {}
+            return {}
+        except Exception:
+            return {}
+        
+
     def addPreviewRow(self, property_name, value):
         """Helper to add a row to the preview table"""
         row = self.page_preview.rowCount()
@@ -430,6 +479,8 @@ class FlowVisualizationDialog(QDialog):
         """Open the full details dialog for the selected page"""
         url = self.preview_url.toPlainText()
         if url:
+            # NOTE: The full details dialog should call get_page_details(url)
+            # and now it will receive 'page_actions' property too.
             self.pageSelected.emit(url)
 
     def exportFlowsToCSV(self):

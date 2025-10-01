@@ -11,6 +11,20 @@ import os
 
 from database.graph_db import get_page_details
 from database.vector_db import get_page_content, find_similar_pages
+import json, ast
+
+def _safe_parse_maybe_json(val, default):
+    if isinstance(val, (list, dict)):
+        return val
+    if isinstance(val, str) and val.strip():
+        try:
+            return json.loads(val)
+        except Exception:
+            try:
+                return ast.literal_eval(val)
+            except Exception:
+                return default
+    return default
 
 
 class PageDetailsDialog(QDialog):
@@ -24,7 +38,6 @@ class PageDetailsDialog(QDialog):
 
     def initUI(self):
         self.setWindowTitle(f"Page Details")
-
         # If parent exists, set size relative to parent
         if self.parent:
             parent_width = self.parent.width()
@@ -122,6 +135,18 @@ class PageDetailsDialog(QDialog):
         self.forms_tree.setColumnWidth(0, 300)
         self.forms_tree.header().setSectionResizeMode(1, QHeaderView.Stretch)
         forms_layout.addWidget(self.forms_tree)
+        
+        # Page Actions
+        self.actions_tab = QWidget()
+        actions_layout = QVBoxLayout(self.actions_tab)
+
+        self.actions_text = QTextEdit()
+        self.actions_text.setReadOnly(True)
+        self.actions_text.setPlaceholderText("No actions captured for this page.")
+        self.actions_text.setMinimumHeight(200)
+        actions_layout.addWidget(self.actions_text)
+
+        self.tab_widget.addTab(self.actions_tab, "Page Actions")
 
         # Add Export Forms button
         export_layout = QHBoxLayout()
@@ -187,6 +212,20 @@ class PageDetailsDialog(QDialog):
     def loadData(self):
         # Get page details from Neo4j
         page_details = get_page_details(self.url)
+        if not page_details or not page_details.get("page_actions"):
+            if page_details is None:
+                page_details = {}
+            page_details["page_actions"] = "{}"        
+        page_actions_raw = page_details["page_actions"]
+        page_actions = _safe_parse_maybe_json(page_actions_raw, {})
+        if isinstance(page_actions, dict) and page_actions.get("actions"):
+            try:
+                pretty = json.dumps(page_actions, indent=2, ensure_ascii=False)
+            except Exception:
+                pretty = str(page_actions)
+            self.actions_text.setText(pretty)
+        else:
+            self.actions_text.setText("{}")
         if not page_details:
             self.title_label.setText("Error: Page not found")
             return
